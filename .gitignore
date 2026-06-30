@@ -1,0 +1,10 @@
+# Build artifacts
+/xlrbridge
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Scratch recordings from the measurement harness
+*.wav
