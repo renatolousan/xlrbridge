@@ -1,16 +1,17 @@
 /*
  * xlrbridge — fixing Discord's problem with handling XLR mics with fancy interfaces.
  *
- * CLI dispatch. Implemented so far: `devices` (Phase 1), the private aggregate
- * layer behind `_aggtest` (Phase 2), `run` — the routing engine (Phase 3), and
- * `setup` + config persistence + `run --dry-run` (Phase 4). `status`/`fix`/
- * `gain`/`uninstall` arrive in later phases (HANDOFF §4).
+ * CLI dispatch. All v1 subcommands are implemented: `devices` (Phase 1), the
+ * private aggregate layer behind `_aggtest` (Phase 2), `run` — the routing
+ * engine (Phase 3), `setup` + config persistence + `run --dry-run` (Phase 4),
+ * `status`/`fix`/`uninstall` + launchd service (Phase 5), and `gain` (Phase 6).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
 #include "audio_devices.h"
 #include "aggregate.h"
@@ -18,7 +19,7 @@
 #include "config.h"
 #include "service.h"
 
-#define XLRBRIDGE_VERSION "0.5.0-phase5"
+#define XLRBRIDGE_VERSION "1.0.0"
 
 /* Default BlackHole UID; the standard install of blackhole-2ch uses this. */
 #define XB_DEFAULT_BLACKHOLE_UID "BlackHole2ch_UID"
@@ -55,7 +56,7 @@ static void print_usage(void) {
         "                do a short BlackHole liveness check, and note if the Pd prototype\n"
         "                (com.scoobert.micbridge) is also loaded.\n"
         "  fix         Re-resolve devices and reload the dev.xlrbridge agent (unload+load).\n"
-        "  gain <dB>   Update digital gain and reload the running engine. (not yet implemented)\n"
+        "  gain <dB>   Update digital gain in config and apply it (reloads the agent if loaded).\n"
         "  uninstall   Unload + remove the dev.xlrbridge agent (engine destroys its aggregate).\n",
         stdout);
 }
@@ -903,6 +904,93 @@ static int cmd_uninstall(void) {
     return 0;
 }
 
+/* `gain <dB>`: update the digital gain in config, then apply it. If the
+ * dev.xlrbridge agent is loaded, reload it (unload+load) so the engine restarts
+ * and picks up the new gain; if it isn't loaded, just persist the config (it
+ * takes effect next time the engine starts). Validates the dB is sane: rejects
+ * absurd magnitudes (> +24 / < -60), warns about clipping risk above 0 dB
+ * (HANDOFF §2). Returns 0 on success. */
+static int cmd_gain(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr,
+            "xlrbridge: gain: missing argument.\n"
+            "Usage: xlrbridge gain <dB>   (e.g. `xlrbridge gain 2` or "
+            "`xlrbridge gain -3`)\n");
+        return 2;
+    }
+    if (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0) {
+        fputs(
+            "xlrbridge gain <dB>\n"
+            "  Set the digital gain applied to the mic before it reaches "
+            "BlackHole.\n"
+            "  Updates ~/.config/xlrbridge/config.json and, if the "
+            "dev.xlrbridge agent\n"
+            "  is loaded, reloads it so the change takes effect immediately.\n"
+            "  Sane range roughly -60..+24 dB; above 0 dB risks clipping — "
+            "prefer\n"
+            "  raising the interface's ANALOG gain for more level (better "
+            "SNR).\n",
+            stdout);
+        return 0;
+    }
+
+    char *end = NULL;
+    double db = strtod(argv[0], &end);
+    if (end == argv[0] || *end != '\0') {
+        fprintf(stderr, "xlrbridge: gain: '%s' is not a number "
+                        "(e.g. `xlrbridge gain 2`).\n", argv[0]);
+        return 2;
+    }
+    /* Reject absurd values. Digital gain here is a simple scalar; anything
+     * outside this band is almost certainly a mistake. */
+    if (db < -60.0 || db > 24.0) {
+        fprintf(stderr, "xlrbridge: gain: %+g dB is out of the sane range "
+                        "(-60 .. +24 dB). Refusing.\n", db);
+        return 2;
+    }
+    if (db > 0.0) {
+        fprintf(stderr, "xlrbridge: warning: +%g dB is positive digital gain — "
+                        "this can CLIP.\n"
+                        "  For more level, prefer raising the interface's "
+                        "ANALOG gain (better SNR;\n"
+                        "  digital gain amplifies noise equally). Continuing.\n",
+                db);
+    }
+
+    /* Persist the new gain (preserve every other field). */
+    xb_config cfg;
+    if (xb_config_load(&cfg) == XB_CONFIG_ERROR) {
+        fprintf(stderr, "xlrbridge: gain: failed to read config\n");
+        return 1;
+    }
+    cfg.gain_db = db;
+    if (xb_config_save(&cfg) != 0) {
+        fprintf(stderr, "xlrbridge: gain: failed to write config\n");
+        return 1;
+    }
+    printf("Set gain_db = %+g dB (x%.5f) in config.\n",
+           db, pow(10.0, db / 20.0));
+
+    /* Apply: if our agent is loaded, reload so the engine restarts with the new
+     * gain. Otherwise the config change is all there is to do. */
+    if (xb_service_is_loaded(XB_AGENT_LABEL)) {
+        printf("Agent %s is loaded; reloading to apply...\n", XB_AGENT_LABEL);
+        xb_service_unload();
+        if (xb_service_load() != 0) {
+            fprintf(stderr, "xlrbridge: gain: failed to reload the agent "
+                            "(config IS saved; run `xlrbridge fix`).\n");
+            return 1;
+        }
+        printf("Reloaded. New gain is live. Check with `xlrbridge status`.\n");
+    } else {
+        printf("Agent %s is not loaded; config saved — the new gain takes "
+               "effect\nthe next time the engine starts "
+               "(`xlrbridge run` or `xlrbridge setup`).\n",
+               XB_AGENT_LABEL);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage();
@@ -951,8 +1039,7 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(cmd, "gain") == 0) {
-        printf("xlrbridge: 'gain' is not yet implemented (Phase 6).\n");
-        return 0;
+        return cmd_gain(argc - 2, argv + 2);
     }
 
     fprintf(stderr, "xlrbridge: unknown command '%s'\n\n", cmd);

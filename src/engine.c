@@ -127,6 +127,19 @@ static OSStatus xb_ioproc(AudioObjectID inDevice,
         return noErr;
     }
 
+    /* Defensive output zeroing: we only intentionally write the two BlackHole
+     * output lanes. Every other output channel (the interface's own playback
+     * channels, which the HAL may hand us holding stale/uninitialised samples)
+     * must be silenced so nothing leaks to the interface outputs. memset over
+     * the buffer storage is RT-safe (no malloc/locks); we zero all output
+     * buffers up front, then write our two lanes on top. */
+    for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
+        AudioBuffer *ob = &outOutputData->mBuffers[b];
+        if (ob->mData != NULL && ob->mDataByteSize > 0) {
+            memset(ob->mData, 0, ob->mDataByteSize);
+        }
+    }
+
     const AudioBuffer *sbuf = &inInputData->mBuffers[ctx->src.buffer];
     AudioBuffer *lbuf = &outOutputData->mBuffers[ctx->dl.buffer];
     AudioBuffer *rbuf = &outOutputData->mBuffers[ctx->dr.buffer];
