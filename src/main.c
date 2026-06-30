@@ -2,8 +2,9 @@
  * xlrbridge — fixing Discord's problem with handling XLR mics with fancy interfaces.
  *
  * CLI dispatch. Implemented so far: `devices` (Phase 1), the private aggregate
- * layer behind `_aggtest` (Phase 2), and `run` — the routing engine (Phase 3).
- * `setup`/`status`/`fix`/`gain`/`uninstall` arrive in later phases (HANDOFF §4).
+ * layer behind `_aggtest` (Phase 2), `run` — the routing engine (Phase 3), and
+ * `setup` + config persistence + `run --dry-run` (Phase 4). `status`/`fix`/
+ * `gain`/`uninstall` arrive in later phases (HANDOFF §4).
  */
 
 #include <stdio.h>
@@ -14,8 +15,9 @@
 #include "audio_devices.h"
 #include "aggregate.h"
 #include "engine.h"
+#include "config.h"
 
-#define XLRBRIDGE_VERSION "0.3.0-phase3"
+#define XLRBRIDGE_VERSION "0.4.0-phase4"
 
 /* Default BlackHole UID; the standard install of blackhole-2ch uses this. */
 #define XB_DEFAULT_BLACKHOLE_UID "BlackHole2ch_UID"
@@ -35,11 +37,18 @@ static void print_usage(void) {
         "\n"
         "Commands:\n"
         "  devices     List audio devices with input/output channels + UIDs; flag BlackHole.\n"
-        "  setup       Interactive: pick interface/channel/gain, create aggregate, install agent. (not yet implemented)\n"
-        "  run         Daemon: wait for devices, start routing IOProc, block until SIGINT/SIGTERM.\n"
-        "                Flags: --interface-uid <uid> (default: auto-pick first non-BlackHole\n"
-        "                input device), --blackhole-uid <uid> (default " XB_DEFAULT_BLACKHOLE_UID "),\n"
-        "                --in-channel <n> (0-based, default 0), --gain-db <x> (default 2.0).\n"
+        "  setup       Interactive: pick interface/channel/gain, verify BlackHole, write config.\n"
+        "                Non-interactive flags (skip prompts when --interface-uid given):\n"
+        "                --interface-uid <uid>, --in-channel <n>, --gain-db <x>,\n"
+        "                --blackhole-uid <uid>, --yes.\n"
+        "  run         Daemon: load config (flags override), wait for devices, start routing\n"
+        "                IOProc, block until SIGINT/SIGTERM.\n"
+        "                Flags: --interface-uid <uid> (default: config, else auto-pick first\n"
+        "                non-BlackHole input device), --blackhole-uid <uid> (default config/"
+            XB_DEFAULT_BLACKHOLE_UID "),\n"
+        "                --in-channel <n> (0-based, default config/0), --gain-db <x>\n"
+        "                (default config/2.0), --dry-run (load+resolve+validate+print plan, exit 0\n"
+        "                WITHOUT grabbing devices or starting audio).\n"
         "  status      Report whether the agent is loaded and signal is flowing. (not yet implemented)\n"
         "  fix         Re-resolve devices, recreate the aggregate, reload the agent. (not yet implemented)\n"
         "  gain <dB>   Update digital gain and reload the running engine. (not yet implemented)\n"
@@ -246,15 +255,391 @@ static int autopick_interface_uid(char *out_uid, size_t out_sz) {
     return 0;
 }
 
-/* `run`: parse flags, resolve the interface (auto-pick if unset), and hand off
- * to the routing engine, which waits for devices, creates the aggregate, runs
- * the IOProc, and blocks until SIGINT/SIGTERM. */
-static int cmd_run(int argc, char **argv) {
-    const char *interface_uid = NULL;
-    const char *blackhole_uid = XB_DEFAULT_BLACKHOLE_UID;
-    unsigned int in_channel   = XB_DEFAULT_IN_CHANNEL;
-    double gain_db            = XB_DEFAULT_GAIN_DB;
+/* Locate BlackHole among enumerated devices: prefer an exact UID match, then
+ * any device flagged is_blackhole. Returns a pointer into `devs` or NULL. */
+static const xb_device *find_blackhole(const xb_device *devs, size_t n,
+                                       const char *preferred_uid) {
+    if (preferred_uid != NULL && preferred_uid[0] != '\0') {
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(devs[i].uid, preferred_uid) == 0) {
+                return &devs[i];
+            }
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (devs[i].is_blackhole) {
+            return &devs[i];
+        }
+    }
+    return NULL;
+}
 
+/* Print the standard "install BlackHole" instructions. */
+static void print_blackhole_instructions(void) {
+    fputs(
+        "\nxlrbridge: BlackHole 2ch is not installed.\n"
+        "It is the clean virtual device Discord will read; xlrbridge routes your\n"
+        "mic into it. Install it with Homebrew:\n"
+        "\n"
+        "    brew install blackhole-2ch\n"
+        "\n"
+        "or download it from https://existential.audio/blackhole/\n"
+        "Then re-run `xlrbridge setup`.\n",
+        stderr);
+}
+
+/* Read a line from stdin into buf (size bufsz), trimming trailing newline and
+ * surrounding whitespace. Returns 0 on success, -1 on EOF/error. */
+static int read_line(char *buf, size_t bufsz) {
+    if (fgets(buf, (int)bufsz, stdin) == NULL) {
+        return -1;
+    }
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+                       buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+        buf[--len] = '\0';
+    }
+    /* Trim leading whitespace. */
+    size_t start = 0;
+    while (buf[start] == ' ' || buf[start] == '\t') {
+        start++;
+    }
+    if (start > 0) {
+        memmove(buf, buf + start, len - start + 1);
+    }
+    return 0;
+}
+
+/* Interactive setup: enumerate candidate interfaces, prompt for interface /
+ * channel / gain, verify BlackHole, write config. Returns 0 on success. */
+static int setup_interactive(xb_config *cfg) {
+    xb_device *devs = NULL;
+    size_t n = 0;
+    if (xb_enumerate_devices(&devs, &n) != noErr) {
+        fprintf(stderr, "xlrbridge: setup: failed to enumerate devices\n");
+        return 1;
+    }
+
+    /* Build the list of candidate interfaces: >= 1 input channel, not BlackHole. */
+    size_t idx[64];
+    size_t cand = 0;
+    for (size_t i = 0; i < n && cand < 64; i++) {
+        if (!devs[i].is_blackhole && devs[i].in_channels > 0) {
+            idx[cand++] = i;
+        }
+    }
+    if (cand == 0) {
+        fprintf(stderr, "xlrbridge: setup: no audio interface with input "
+                        "channels found. Plug in your interface and retry.\n");
+        free(devs);
+        return 1;
+    }
+
+    printf("Available input interfaces:\n");
+    for (size_t k = 0; k < cand; k++) {
+        const xb_device *d = &devs[idx[k]];
+        printf("  [%zu] %-28s %u in  (UID %s)\n", k + 1, d->name,
+               d->in_channels, d->uid);
+    }
+
+    /* Prompt for interface choice. */
+    size_t chosen = 0;
+    char line[256];
+    for (;;) {
+        printf("Pick an interface [1-%zu] (default 1): ", cand);
+        fflush(stdout);
+        if (read_line(line, sizeof(line)) != 0) {
+            fprintf(stderr, "\nxlrbridge: setup: no input; aborting.\n");
+            free(devs);
+            return 1;
+        }
+        if (line[0] == '\0') {
+            chosen = 0;
+            break;
+        }
+        char *end = NULL;
+        long v = strtol(line, &end, 10);
+        if (end != line && *end == '\0' && v >= 1 && (size_t)v <= cand) {
+            chosen = (size_t)v - 1;
+            break;
+        }
+        printf("  please enter a number between 1 and %zu.\n", cand);
+    }
+    const xb_device *iface = &devs[idx[chosen]];
+    unsigned int iface_in = iface->in_channels;
+    printf("Selected: %s (%u input channels)\n", iface->name, iface_in);
+
+    /* Prompt for the mic's input channel (0-based). */
+    int channel = 0;
+    for (;;) {
+        printf("Which input channel is the mic? [0-%u] (default 0): ",
+               iface_in - 1);
+        fflush(stdout);
+        if (read_line(line, sizeof(line)) != 0) {
+            fprintf(stderr, "\nxlrbridge: setup: no input; aborting.\n");
+            free(devs);
+            return 1;
+        }
+        if (line[0] == '\0') {
+            channel = 0;
+            break;
+        }
+        char *end = NULL;
+        long v = strtol(line, &end, 10);
+        if (end != line && *end == '\0' && v >= 0 && (unsigned int)v < iface_in) {
+            channel = (int)v;
+            break;
+        }
+        printf("  please enter a channel between 0 and %u.\n", iface_in - 1);
+    }
+
+    /* Prompt for gain. */
+    double gain = XB_CONFIG_DEFAULT_GAIN_DB;
+    for (;;) {
+        printf("Digital gain in dB (default %+g): ", XB_CONFIG_DEFAULT_GAIN_DB);
+        fflush(stdout);
+        if (read_line(line, sizeof(line)) != 0) {
+            fprintf(stderr, "\nxlrbridge: setup: no input; aborting.\n");
+            free(devs);
+            return 1;
+        }
+        if (line[0] == '\0') {
+            gain = XB_CONFIG_DEFAULT_GAIN_DB;
+            break;
+        }
+        char *end = NULL;
+        double v = strtod(line, &end);
+        if (end != line && *end == '\0') {
+            gain = v;
+            break;
+        }
+        printf("  please enter a number (e.g. 2 or 1.5).\n");
+    }
+
+    /* Verify BlackHole is present. */
+    const xb_device *bh = find_blackhole(devs, n, cfg->blackhole_uid);
+    if (bh == NULL) {
+        print_blackhole_instructions();
+        free(devs);
+        return 3;
+    }
+
+    /* Commit choices into cfg. */
+    snprintf(cfg->interface_uid, sizeof(cfg->interface_uid), "%s", iface->uid);
+    cfg->in_channel = channel;
+    cfg->gain_db    = gain;
+    snprintf(cfg->blackhole_uid, sizeof(cfg->blackhole_uid), "%s", bh->uid);
+
+    free(devs);
+    return 0;
+}
+
+/* Non-interactive setup: caller already populated cfg from flags. Verify the
+ * interface UID resolves to an in-range channel and BlackHole is present.
+ * Returns 0 on success. */
+static int setup_noninteractive(xb_config *cfg) {
+    xb_device *devs = NULL;
+    size_t n = 0;
+    if (xb_enumerate_devices(&devs, &n) != noErr) {
+        fprintf(stderr, "xlrbridge: setup: failed to enumerate devices\n");
+        return 1;
+    }
+
+    /* Locate the named interface so we can validate the channel. */
+    const xb_device *iface = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(devs[i].uid, cfg->interface_uid) == 0) {
+            iface = &devs[i];
+            break;
+        }
+    }
+    if (iface == NULL) {
+        fprintf(stderr, "xlrbridge: setup: interface UID '%s' not found among "
+                        "current devices.\n", cfg->interface_uid);
+        free(devs);
+        return 1;
+    }
+    if (cfg->in_channel < 0 ||
+        (unsigned int)cfg->in_channel >= iface->in_channels) {
+        fprintf(stderr, "xlrbridge: setup: in-channel %d out of range for '%s' "
+                        "(has %u input channels, valid 0-%u).\n",
+                cfg->in_channel, iface->name, iface->in_channels,
+                iface->in_channels > 0 ? iface->in_channels - 1 : 0);
+        free(devs);
+        return 1;
+    }
+
+    const xb_device *bh = find_blackhole(devs, n, cfg->blackhole_uid);
+    if (bh == NULL) {
+        print_blackhole_instructions();
+        free(devs);
+        return 3;
+    }
+    /* Normalize to the resolved BlackHole UID. */
+    snprintf(cfg->blackhole_uid, sizeof(cfg->blackhole_uid), "%s", bh->uid);
+
+    free(devs);
+    return 0;
+}
+
+/* `setup`: interactive by default; non-interactive when --interface-uid (and
+ * friends) are given. Detects+instructs BlackHole (never auto-installs), writes
+ * the config, prints a confirmation + next step. */
+static int cmd_setup(int argc, char **argv) {
+    xb_config cfg;
+    xb_config_defaults(&cfg);
+
+    const char *interface_uid = NULL;
+    int have_in_channel = 0, have_gain = 0;
+
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--interface-uid") == 0 && i + 1 < argc) {
+            interface_uid = argv[++i];
+        } else if (strcmp(a, "--in-channel") == 0 && i + 1 < argc) {
+            cfg.in_channel = (int)strtol(argv[++i], NULL, 10);
+            have_in_channel = 1;
+        } else if (strcmp(a, "--gain-db") == 0 && i + 1 < argc) {
+            cfg.gain_db = strtod(argv[++i], NULL);
+            have_gain = 1;
+        } else if (strcmp(a, "--blackhole-uid") == 0 && i + 1 < argc) {
+            snprintf(cfg.blackhole_uid, sizeof(cfg.blackhole_uid), "%s",
+                     argv[++i]);
+        } else if (strcmp(a, "--yes") == 0 || strcmp(a, "-y") == 0) {
+            /* accepted for scripting; setup writes config either way */
+        } else {
+            fprintf(stderr, "xlrbridge: setup: unknown/incomplete option '%s'\n",
+                    a);
+            return 2;
+        }
+    }
+    (void)have_in_channel;
+    (void)have_gain;
+
+    int rc;
+    if (interface_uid != NULL) {
+        /* Non-interactive path: --interface-uid drives it. */
+        snprintf(cfg.interface_uid, sizeof(cfg.interface_uid), "%s",
+                 interface_uid);
+        rc = setup_noninteractive(&cfg);
+    } else {
+        rc = setup_interactive(&cfg);
+    }
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (xb_config_save(&cfg) != 0) {
+        fprintf(stderr, "xlrbridge: setup: failed to write config\n");
+        return 1;
+    }
+
+    char path[1024];
+    xb_config_path(path, sizeof(path));
+    printf("\nConfig written to %s\n", path);
+    printf("  interface_uid : %s\n", cfg.interface_uid);
+    printf("  in_channel    : %d\n", cfg.in_channel);
+    printf("  gain_db       : %+g\n", cfg.gain_db);
+    printf("  blackhole_uid : %s\n", cfg.blackhole_uid);
+    printf("\nNext: run `xlrbridge run` to start routing now,\n"
+           "or it'll be installed as a login service in a later step.\n");
+    return 0;
+}
+
+/* `run --dry-run`: load config + flag overrides, resolve both devices by UID,
+ * validate the channel is in range, print the routing plan, and exit 0 WITHOUT
+ * creating the aggregate or starting audio. Non-disruptive: grabs nothing.
+ * Returns 0 on a valid plan, non-zero on a resolution/validation failure. */
+static int run_dry(const xb_engine_params *p) {
+    printf("xlrbridge run --dry-run: validating config (no devices grabbed)\n\n");
+
+    AudioDeviceID iface_id = xb_resolve_device_by_uid(p->interface_uid);
+    AudioDeviceID bh_id    = xb_resolve_device_by_uid(p->blackhole_uid);
+
+    int ok = 1;
+
+    if (iface_id == XB_DEVICE_UNKNOWN) {
+        fprintf(stderr, "  interface : UID '%s' -> NOT FOUND\n",
+                p->interface_uid);
+        ok = 0;
+    }
+    if (bh_id == XB_DEVICE_UNKNOWN) {
+        fprintf(stderr, "  blackhole : UID '%s' -> NOT FOUND\n",
+                p->blackhole_uid);
+        ok = 0;
+    }
+    if (!ok) {
+        fprintf(stderr, "\nxlrbridge: run --dry-run: required device(s) not "
+                        "present.\n");
+        return 1;
+    }
+
+    /* Validate the chosen input channel against the interface's input count. */
+    xb_device *devs = NULL;
+    size_t n = 0;
+    unsigned int iface_in = 0;
+    char iface_name[256] = "?", bh_name[256] = "?";
+    if (xb_enumerate_devices(&devs, &n) == noErr) {
+        for (size_t i = 0; i < n; i++) {
+            if (devs[i].id == iface_id) {
+                iface_in = devs[i].in_channels;
+                snprintf(iface_name, sizeof(iface_name), "%s", devs[i].name);
+            }
+            if (devs[i].id == bh_id) {
+                snprintf(bh_name, sizeof(bh_name), "%s", devs[i].name);
+            }
+        }
+        free(devs);
+    }
+
+    if (iface_in == 0) {
+        fprintf(stderr, "  interface '%s' reports 0 input channels.\n",
+                iface_name);
+        return 1;
+    }
+    if (p->in_channel >= iface_in) {
+        fprintf(stderr, "  in-channel %u out of range for '%s' (valid 0-%u).\n",
+                p->in_channel, iface_name, iface_in - 1);
+        return 1;
+    }
+
+    printf("  interface : %-24s (UID %s)\n", iface_name, p->interface_uid);
+    printf("              %u input channels; routing input channel %u\n",
+           iface_in, p->in_channel);
+    printf("  blackhole : %-24s (UID %s)\n", bh_name, p->blackhole_uid);
+    printf("  gain      : %+g dB\n", p->gain_db);
+    printf("  rate      : %.0f Hz\n",
+           p->sample_rate > 0 ? p->sample_rate
+                              : (double)XB_AGGREGATE_DEFAULT_SAMPLE_RATE);
+    printf("\nPlan: aggregate [%s + %s], copy interface input ch%u (x gain)\n"
+           "      into both BlackHole output channels (dual-mono). Discord reads\n"
+           "      '%s' as its mic.\n",
+           iface_name, bh_name, p->in_channel, bh_name);
+    printf("\nDry run OK. (Aggregate not created; no audio started.)\n");
+    return 0;
+}
+
+/* `run`: load config (flags override config; config overrides built-in
+ * defaults), resolve the interface (auto-pick if still unset), then either
+ * print the plan (--dry-run) or hand off to the routing engine. */
+static int cmd_run(int argc, char **argv) {
+    /* 1. Start from config (which itself starts from built-in defaults). */
+    xb_config cfg;
+    int cfg_status = xb_config_load(&cfg);
+    if (cfg_status == XB_CONFIG_ERROR) {
+        fprintf(stderr, "xlrbridge: run: failed to read config\n");
+        return 1;
+    }
+
+    const char *interface_uid = cfg.interface_uid[0] ? cfg.interface_uid : NULL;
+    char blackhole_buf[256];
+    snprintf(blackhole_buf, sizeof(blackhole_buf), "%s", cfg.blackhole_uid);
+    const char *blackhole_uid = blackhole_buf;
+    unsigned int in_channel   = (unsigned int)cfg.in_channel;
+    double gain_db            = cfg.gain_db;
+    int dry_run               = 0;
+
+    /* 2. Flags override config. */
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "--interface-uid") == 0 && i + 1 < argc) {
@@ -265,14 +650,27 @@ static int cmd_run(int argc, char **argv) {
             in_channel = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(a, "--gain-db") == 0 && i + 1 < argc) {
             gain_db = strtod(argv[++i], NULL);
+        } else if (strcmp(a, "--dry-run") == 0) {
+            dry_run = 1;
         } else {
             fprintf(stderr, "xlrbridge: run: unknown/incomplete option '%s'\n", a);
             return 2;
         }
     }
 
+    /* 3. Auto-pick the interface only if neither config nor flags supplied one.
+     * In --dry-run we do NOT auto-pick: a missing interface should surface as a
+     * clear config error, not be silently substituted. */
     char auto_uid[256];
     if (interface_uid == NULL) {
+        if (dry_run) {
+            fprintf(stderr, "xlrbridge: run --dry-run: no interface configured "
+                            "(run `xlrbridge setup`, or pass --interface-uid).\n");
+            if (cfg_status == XB_CONFIG_NOT_FOUND) {
+                fprintf(stderr, "  (no config file present)\n");
+            }
+            return 1;
+        }
         if (autopick_interface_uid(auto_uid, sizeof(auto_uid)) != 0) {
             return 1;
         }
@@ -289,6 +687,10 @@ static int cmd_run(int argc, char **argv) {
         .sample_rate        = XB_AGGREGATE_DEFAULT_SAMPLE_RATE,
         .readiness_timeout_s = XB_READINESS_TIMEOUT_S,
     };
+
+    if (dry_run) {
+        return run_dry(&p);
+    }
     return xb_engine_run(&p);
 }
 
@@ -323,8 +725,11 @@ int main(int argc, char **argv) {
         return cmd_run(argc - 2, argv + 2);
     }
 
-    if (strcmp(cmd, "setup") == 0 ||
-        strcmp(cmd, "status") == 0 || strcmp(cmd, "fix") == 0 ||
+    if (strcmp(cmd, "setup") == 0) {
+        return cmd_setup(argc - 2, argv + 2);
+    }
+
+    if (strcmp(cmd, "status") == 0 || strcmp(cmd, "fix") == 0 ||
         strcmp(cmd, "gain") == 0 || strcmp(cmd, "uninstall") == 0) {
         printf("xlrbridge: '%s' is not yet implemented.\n", cmd);
         return 0;
