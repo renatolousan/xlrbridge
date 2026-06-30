@@ -8,3 +8,6 @@
 
 # Scratch recordings from the measurement harness
 *.wav
+
+# Internal build-process scratch (subagent-driven-development ledger)
+.superpowers/
