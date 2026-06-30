@@ -1,19 +1,27 @@
 /*
  * xlrbridge — fixing Discord's problem with handling XLR mics with fancy interfaces.
  *
- * Phase 0: scaffold only. This is a stub CLI that prints usage and a version.
- * No CoreAudio calls yet — device enumeration, aggregate creation, and the
- * routing engine arrive in later phases (see HANDOFF.md §4).
+ * CLI dispatch. Implemented so far: `devices` (Phase 1), the private aggregate
+ * layer behind `_aggtest` (Phase 2), and `run` — the routing engine (Phase 3).
+ * `setup`/`status`/`fix`/`gain`/`uninstall` arrive in later phases (HANDOFF §4).
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "audio_devices.h"
 #include "aggregate.h"
+#include "engine.h"
 
-#define XLRBRIDGE_VERSION "0.2.0-phase2"
+#define XLRBRIDGE_VERSION "0.3.0-phase3"
+
+/* Default BlackHole UID; the standard install of blackhole-2ch uses this. */
+#define XB_DEFAULT_BLACKHOLE_UID "BlackHole2ch_UID"
+#define XB_DEFAULT_GAIN_DB       2.0
+#define XB_DEFAULT_IN_CHANNEL    0u
+#define XB_READINESS_TIMEOUT_S   8
 
 static void print_usage(void) {
     fputs(
@@ -28,7 +36,10 @@ static void print_usage(void) {
         "Commands:\n"
         "  devices     List audio devices with input/output channels + UIDs; flag BlackHole.\n"
         "  setup       Interactive: pick interface/channel/gain, create aggregate, install agent. (not yet implemented)\n"
-        "  run         Daemon: wait for devices, start routing IOProc, block. (not yet implemented)\n"
+        "  run         Daemon: wait for devices, start routing IOProc, block until SIGINT/SIGTERM.\n"
+        "                Flags: --interface-uid <uid> (default: auto-pick first non-BlackHole\n"
+        "                input device), --blackhole-uid <uid> (default " XB_DEFAULT_BLACKHOLE_UID "),\n"
+        "                --in-channel <n> (0-based, default 0), --gain-db <x> (default 2.0).\n"
         "  status      Report whether the agent is loaded and signal is flowing. (not yet implemented)\n"
         "  fix         Re-resolve devices, recreate the aggregate, reload the agent. (not yet implemented)\n"
         "  gain <dB>   Update digital gain and reload the running engine. (not yet implemented)\n"
@@ -213,6 +224,74 @@ static int cmd_aggtest(void) {
     return ok ? 0 : 1;
 }
 
+/* Auto-pick an interface UID when --interface-uid wasn't given: the E2x2, i.e.
+ * the first non-BlackHole device with input channels. Writes into out_uid
+ * (size out_sz). Returns 0 on success, 1 if none found / enumeration failed. */
+static int autopick_interface_uid(char *out_uid, size_t out_sz) {
+    xb_device *devs = NULL;
+    size_t n = 0;
+    if (xb_enumerate_devices(&devs, &n) != noErr) {
+        fprintf(stderr, "xlrbridge: run: failed to enumerate devices\n");
+        return 1;
+    }
+    const xb_device *iface = pick_interface(devs, n);
+    if (iface == NULL) {
+        fprintf(stderr, "xlrbridge: run: no input interface found "
+                        "(plug in your interface, or pass --interface-uid)\n");
+        free(devs);
+        return 1;
+    }
+    snprintf(out_uid, out_sz, "%s", iface->uid);
+    free(devs);
+    return 0;
+}
+
+/* `run`: parse flags, resolve the interface (auto-pick if unset), and hand off
+ * to the routing engine, which waits for devices, creates the aggregate, runs
+ * the IOProc, and blocks until SIGINT/SIGTERM. */
+static int cmd_run(int argc, char **argv) {
+    const char *interface_uid = NULL;
+    const char *blackhole_uid = XB_DEFAULT_BLACKHOLE_UID;
+    unsigned int in_channel   = XB_DEFAULT_IN_CHANNEL;
+    double gain_db            = XB_DEFAULT_GAIN_DB;
+
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--interface-uid") == 0 && i + 1 < argc) {
+            interface_uid = argv[++i];
+        } else if (strcmp(a, "--blackhole-uid") == 0 && i + 1 < argc) {
+            blackhole_uid = argv[++i];
+        } else if (strcmp(a, "--in-channel") == 0 && i + 1 < argc) {
+            in_channel = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(a, "--gain-db") == 0 && i + 1 < argc) {
+            gain_db = strtod(argv[++i], NULL);
+        } else {
+            fprintf(stderr, "xlrbridge: run: unknown/incomplete option '%s'\n", a);
+            return 2;
+        }
+    }
+
+    char auto_uid[256];
+    if (interface_uid == NULL) {
+        if (autopick_interface_uid(auto_uid, sizeof(auto_uid)) != 0) {
+            return 1;
+        }
+        interface_uid = auto_uid;
+        fprintf(stderr, "xlrbridge: run: auto-picked interface UID %s\n",
+                interface_uid);
+    }
+
+    xb_engine_params p = {
+        .interface_uid      = interface_uid,
+        .blackhole_uid      = blackhole_uid,
+        .in_channel         = in_channel,
+        .gain_db            = gain_db,
+        .sample_rate        = XB_AGGREGATE_DEFAULT_SAMPLE_RATE,
+        .readiness_timeout_s = XB_READINESS_TIMEOUT_S,
+    };
+    return xb_engine_run(&p);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage();
@@ -240,7 +319,11 @@ int main(int argc, char **argv) {
         return cmd_aggtest();
     }
 
-    if (strcmp(cmd, "setup") == 0 || strcmp(cmd, "run") == 0 ||
+    if (strcmp(cmd, "run") == 0) {
+        return cmd_run(argc - 2, argv + 2);
+    }
+
+    if (strcmp(cmd, "setup") == 0 ||
         strcmp(cmd, "status") == 0 || strcmp(cmd, "fix") == 0 ||
         strcmp(cmd, "gain") == 0 || strcmp(cmd, "uninstall") == 0) {
         printf("xlrbridge: '%s' is not yet implemented.\n", cmd);
