@@ -4,19 +4,31 @@ Plan: HANDOFF.md §4 (Phases 0–6). Coordinator = main session; implementers = 
 Rule: always keep one implementer in flight so completion notifications re-drive the loop — never end a turn idle until v1 is done.
 
 - Phase 0: complete (ff4c56c) — scaffold + Makefile + measure.sh.
-- Phase 1: complete (94fa21f) — `devices` (UID enum, BlackHole detect, exit codes).
-- Phase 2: complete (648bbaf) — aggregate layer + `_aggtest` (private, offsets from real layout, idempotent). Verified.
-- Phase 3: complete (03f5c67) — routing engine `run` + IOProc. CORE milestone proven: 0 dropouts on continuous tone, RT-safe IOProc, aggregate destroyed on all paths, readiness wait. Code-reviewed by coordinator. Pd prototype restored & verified alive.
-- Phase 4: complete — config persistence (`src/config.{c,h}`, flat JSON at ~/.config/xlrbridge/config.json, hand-rolled tolerant parser/serializer, no deps), `setup` command (interactive + non-interactive flags `--interface-uid/--in-channel/--gain-db/--blackhole-uid/--yes`, detect+instruct BlackHole, never auto-installs), `run` now loads config (flags > config > defaults), `run --dry-run` (resolve+validate+print plan, exit 0, no device grab — non-disruptive). Version 0.4.0-phase4. Tested against live E2x2 + BlackHole without disturbing the Pd bridge.
-- Phase 5: pending (launchd service, status/fix/uninstall, boot race, CUTOVER from Pd prototype to xlrbridge).
+- Phase 1: complete (94fa21f) — `devices`.
+- Phase 2: complete (648bbaf) — aggregate layer + `_aggtest`.
+- Phase 3: complete (03f5c67) — routing engine `run`, IOProc, 0 dropouts proven, RT-safe. Pd restored.
+- Phase 4: complete (039719a) — config + `setup` + `run` reads config + `run --dry-run`. Verified non-disruptively; Pd bridge untouched.
+- Phase 5: complete — launchd service (src/service.{c,h}), setup auto-installs+loads dev.xlrbridge agent (gated: refuses while Pd loaded; --no-service skips), status/fix/uninstall implemented, version 0.5.0-phase5. CUTOVER OUTCOME = **FALLBACK (Pd left live)**, see below.
 - Phase 6: pending (gain, polish, packaging, README).
 
 ## Open findings (for final review)
-- MINOR (Phase 3): IOProc writes only BlackHole output channels; doesn't zero the interface's other output channels. Prototype did the same with no issue, but defensively zeroing unused outputs is best practice. Address in a later phase or final review.
+- MINOR (Phase 3): IOProc doesn't zero the interface's non-BlackHole output channels. Prototype did the same with no issue. Defensive zeroing is best practice.
+- Phase 5 cutover = FALLBACK. The launchd-run xlrbridge engine DID start cleanly under launchd (created its private aggregate, no TCC denial in /tmp/xlrbridge.log: it logged "aggregate id=185 ... routing in ch 2 -> BlackHole out 6,7" and ran with no AudioDeviceStart failure once no other client held BlackHole). BUT the continuous-tone validation could NOT be measured: during testing, force-killing (kill -9) hung ffmpeg avfoundation capture clients wedged the CoreAudio *capture* path system-wide — afterwards even a plain `ffmpeg -f avfoundation -i :BlackHole 2ch`/`:E2x2` capture hangs (rc=137) with NO bridge running. Without a working capture, the mandated "0 dropouts" SUCCESS evidence was unobtainable, so per CUTOVER SAFETY we did NOT cut over.
+- Action left for the user: the avfoundation capture wedge clears with a coreaudiod restart (`sudo killall coreaudiod`) — not run here (no sudo / would disrupt all audio). The wedge is in the avfoundation record path; Discord uses the CoreAudio HAL input path (likely separate), and Pd is writing BlackHole normally, so Discord mic may well be fine — but unverified.
+- TCC finding: NO microphone-permission denial was observed for the launchd-run engine. The engine opened the aggregate (whose master sub-device is the E2x2 input) under launchd without a TCC error. The one failure seen (OSStatus 268451843) was device contention from the hung capture client, not permission. (Caveat: not measured end-to-end due to the capture wedge.)
+- `status`/liveness hardened: the avfoundation capture in `xlrbridge status` is now hard-killed after 8 s so a wedged capture path can never hang the command; it reports "capture FAILED" instead.
+
+## Phase 5 final state (FALLBACK)
+- LOADED + running: com.scoobert.micbridge (Pd, the live bridge).
+- dev.xlrbridge: NOT loaded; plist left on disk (~/Library/LaunchAgents/dev.xlrbridge.plist) as the documented fallback (proven to start under launchd).
+- config.json restored to real mic: in_channel 0, gain_db 2.
+- Never had both agents loaded simultaneously.
 
 ## Design refinements
-- Aggregate PRIVATE, created/destroyed by `run` (not setup). setup only writes config + (Phase 5) installs agent.
-- Channel layout (E2x2): iface inputs at offset 0; BlackHole outputs at offset 6. Engine: input[in_channel]→output[6],[7] × gain.
+- Aggregate PRIVATE, created/destroyed by `run`. setup writes config; Phase 5 setup also installs the launchd agent (label `dev.xlrbridge`).
+- Channel layout (E2x2): iface inputs offset 0; BlackHole outputs offset 6.
 
-## IMPORTANT — keep the user's mic bridge alive
-Pd prototype (LaunchAgent com.scoobert.micbridge) is the user's LIVE Discord fix. Tests that start the xlrbridge engine must stop Pd first (contention) then restart it (`bash ~/.claude/skills/fix-mic-bridge/repair.sh`). CUTOVER to the xlrbridge binary happens in Phase 5 once fully validated. Prefer non-disruptive tests (e.g. `run --dry-run`) where possible.
+## CUTOVER SAFETY (Phase 5) — the user must wake to a WORKING bridge
+Pd prototype (LaunchAgent com.scoobert.micbridge) is the LIVE bridge. Phase 5 cutover: stop Pd, install+load the xlrbridge agent, then VALIDATE the launchd-run engine actually gets signal (continuous-tone test on a loopback channel — this also proves macOS mic/TCC permission works under launchd, a known gotcha).
+- If validated → leave xlrbridge LIVE (config back to channel 0 = real mic); keep Pd's plist on disk (unloaded) as documented fallback.
+- If it fails (TCC-denied silence / any error) → DO NOT cut over: reload Pd (`bash ~/.claude/skills/fix-mic-bridge/repair.sh`), leave xlrbridge agent unloaded, document the issue for the user.

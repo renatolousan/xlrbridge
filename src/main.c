@@ -16,8 +16,9 @@
 #include "aggregate.h"
 #include "engine.h"
 #include "config.h"
+#include "service.h"
 
-#define XLRBRIDGE_VERSION "0.4.0-phase4"
+#define XLRBRIDGE_VERSION "0.5.0-phase5"
 
 /* Default BlackHole UID; the standard install of blackhole-2ch uses this. */
 #define XB_DEFAULT_BLACKHOLE_UID "BlackHole2ch_UID"
@@ -37,10 +38,11 @@ static void print_usage(void) {
         "\n"
         "Commands:\n"
         "  devices     List audio devices with input/output channels + UIDs; flag BlackHole.\n"
-        "  setup       Interactive: pick interface/channel/gain, verify BlackHole, write config.\n"
+        "  setup       Interactive: pick interface/channel/gain, verify BlackHole, write config,\n"
+        "                then install + load the dev.xlrbridge LaunchAgent (login service).\n"
         "                Non-interactive flags (skip prompts when --interface-uid given):\n"
         "                --interface-uid <uid>, --in-channel <n>, --gain-db <x>,\n"
-        "                --blackhole-uid <uid>, --yes.\n"
+        "                --blackhole-uid <uid>, --yes, --no-service (write config only).\n"
         "  run         Daemon: load config (flags override), wait for devices, start routing\n"
         "                IOProc, block until SIGINT/SIGTERM.\n"
         "                Flags: --interface-uid <uid> (default: config, else auto-pick first\n"
@@ -49,10 +51,12 @@ static void print_usage(void) {
         "                --in-channel <n> (0-based, default config/0), --gain-db <x>\n"
         "                (default config/2.0), --dry-run (load+resolve+validate+print plan, exit 0\n"
         "                WITHOUT grabbing devices or starting audio).\n"
-        "  status      Report whether the agent is loaded and signal is flowing. (not yet implemented)\n"
-        "  fix         Re-resolve devices, recreate the aggregate, reload the agent. (not yet implemented)\n"
+        "  status      Report whether the dev.xlrbridge agent is loaded + engine running,\n"
+        "                do a short BlackHole liveness check, and note if the Pd prototype\n"
+        "                (com.scoobert.micbridge) is also loaded.\n"
+        "  fix         Re-resolve devices and reload the dev.xlrbridge agent (unload+load).\n"
         "  gain <dB>   Update digital gain and reload the running engine. (not yet implemented)\n"
-        "  uninstall   Unload/remove the agent, destroy the aggregate. (not yet implemented)\n",
+        "  uninstall   Unload + remove the dev.xlrbridge agent (engine destroys its aggregate).\n",
         stdout);
 }
 
@@ -490,7 +494,7 @@ static int cmd_setup(int argc, char **argv) {
     xb_config_defaults(&cfg);
 
     const char *interface_uid = NULL;
-    int have_in_channel = 0, have_gain = 0;
+    int have_in_channel = 0, have_gain = 0, no_service = 0;
 
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
@@ -505,6 +509,8 @@ static int cmd_setup(int argc, char **argv) {
         } else if (strcmp(a, "--blackhole-uid") == 0 && i + 1 < argc) {
             snprintf(cfg.blackhole_uid, sizeof(cfg.blackhole_uid), "%s",
                      argv[++i]);
+        } else if (strcmp(a, "--no-service") == 0) {
+            no_service = 1;
         } else if (strcmp(a, "--yes") == 0 || strcmp(a, "-y") == 0) {
             /* accepted for scripting; setup writes config either way */
         } else {
@@ -541,8 +547,46 @@ static int cmd_setup(int argc, char **argv) {
     printf("  in_channel    : %d\n", cfg.in_channel);
     printf("  gain_db       : %+g\n", cfg.gain_db);
     printf("  blackhole_uid : %s\n", cfg.blackhole_uid);
-    printf("\nNext: run `xlrbridge run` to start routing now,\n"
-           "or it'll be installed as a login service in a later step.\n");
+
+    if (no_service) {
+        printf("\nConfig only (--no-service). Run `xlrbridge run` to start "
+               "routing now,\nor `xlrbridge setup` (without --no-service) to "
+               "install the login service.\n");
+        return 0;
+    }
+
+    /* CUTOVER SAFETY: never quietly steal the mic from another live bridge.
+     * If the Pd prototype agent is loaded, refuse to auto-install our agent
+     * (the two would contend for the interface). The operator must stop Pd
+     * first (or pass --no-service). */
+    if (xb_service_is_loaded(XB_PD_AGENT_LABEL)) {
+        fprintf(stderr,
+            "\nxlrbridge: setup: another bridge (%s) is currently loaded.\n"
+            "  Not installing the dev.xlrbridge agent — the two would contend\n"
+            "  for the interface. Config IS written. To cut over: stop the Pd\n"
+            "  bridge (`launchctl unload ~/Library/LaunchAgents/%s.plist`) then\n"
+            "  re-run setup, or run setup with --no-service and switch manually.\n",
+            XB_PD_AGENT_LABEL, XB_PD_AGENT_LABEL);
+        return 0;
+    }
+
+    printf("\nInstalling login service (LaunchAgent %s)...\n", XB_AGENT_LABEL);
+    if (xb_service_write_plist(NULL) != 0) {
+        fprintf(stderr, "xlrbridge: setup: failed to write the LaunchAgent "
+                        "plist\n");
+        return 1;
+    }
+    /* Reload cleanly in case a stale instance is loaded. */
+    xb_service_unload();
+    if (xb_service_load() != 0) {
+        fprintf(stderr, "xlrbridge: setup: failed to load the LaunchAgent\n");
+        return 1;
+    }
+    char plist[1024];
+    xb_service_plist_path(plist, sizeof(plist));
+    printf("Installed + loaded %s\n  -> %s\n", XB_AGENT_LABEL, plist);
+    printf("\nThe engine now starts at login and is running. Check it with "
+           "`xlrbridge status`.\n");
     return 0;
 }
 
@@ -694,6 +738,171 @@ static int cmd_run(int argc, char **argv) {
     return xb_engine_run(&p);
 }
 
+/* Short, non-grabbing liveness check of BlackHole: record 2 s via ffmpeg and
+ * report mean_volume. Records by name (":BlackHole 2ch"), which opens BlackHole
+ * directly as an INPUT — it does not touch the interface or the aggregate, so
+ * it doesn't disturb the running engine. Prints the result; returns 0 if it
+ * could measure a level, -1 if ffmpeg is missing or the capture failed. */
+static int blackhole_liveness(void) {
+    if (system("command -v ffmpeg >/dev/null 2>&1") != 0) {
+        printf("  liveness  : (ffmpeg not installed; skipping signal check)\n");
+        return -1;
+    }
+    /* Record 2 s, then read mean_volume. The avfoundation capture can wedge if
+     * CoreAudio's capture path is in a bad state, so hard-kill it after a bound
+     * (well past the 2 s record) — `status` must never hang. */
+    const char *cmd =
+        "w=$(mktemp -t xlrbridge_live).wav; "
+        "( ffmpeg -nostdin -hide_banner -loglevel error -f avfoundation "
+        "    -i ':BlackHole 2ch' -t 2 -y \"$w\" </dev/null 2>/dev/null ) & "
+        "cpid=$!; "
+        "( sleep 8; kill -9 $cpid 2>/dev/null ) & wpid=$!; "
+        "wait $cpid 2>/dev/null; rc=$?; kill $wpid 2>/dev/null; "
+        "if [ $rc -eq 0 ] && [ -s \"$w\" ]; then "
+        "  ffmpeg -hide_banner -i \"$w\" -af volumedetect -f null /dev/null 2>&1 "
+        "    | grep mean_volume; "
+        "else echo 'CAPTURE_FAILED'; fi; "
+        "rm -f \"$w\"";
+    char out[512];
+    FILE *fp = popen(cmd, "r");
+    if (fp == NULL) {
+        printf("  liveness  : (could not run capture)\n");
+        return -1;
+    }
+    size_t total = 0;
+    size_t r;
+    while (total + 1 < sizeof(out) &&
+           (r = fread(out + total, 1, sizeof(out) - 1 - total, fp)) > 0) {
+        total += r;
+    }
+    out[total] = '\0';
+    int rc = pclose(fp);
+
+    /* Parse "mean_volume: -XX.X dB". */
+    const char *m = strstr(out, "mean_volume:");
+    if (m == NULL) {
+        if (strstr(out, "CAPTURE_FAILED") != NULL) {
+            printf("  liveness  : capture FAILED (BlackHole could not be opened "
+                   "for recording —\n              mic/TCC permission, or "
+                   "CoreAudio capture path wedged)\n");
+        } else {
+            printf("  liveness  : (no signal measured%s)\n",
+                   rc != 0 ? "; capture failed" : "");
+        }
+        return -1;
+    }
+    double mean = strtod(m + strlen("mean_volume:"), NULL);
+    printf("  liveness  : mean_volume %.1f dBFS  ->  %s\n", mean,
+           mean > -91.0 ? "SIGNAL FLOWING"
+                        : "SILENT (<= -91; not flowing / TCC-denied?)");
+    return 0;
+}
+
+/* `status`: report whether the dev.xlrbridge agent is loaded + its engine
+ * process is running, do a short BlackHole liveness check, and note whether the
+ * Pd prototype agent is also loaded (so the user sees which bridge is active).
+ * Always exits 0 (it's a report). */
+static int cmd_status(void) {
+    printf("xlrbridge status\n\n");
+
+    int xb_loaded = xb_service_is_loaded(XB_AGENT_LABEL);
+    long xb_pid = -1;
+    int xb_running = (xb_service_agent_pid(XB_AGENT_LABEL, &xb_pid) == 0 &&
+                      xb_pid > 0);
+
+    printf("  agent     : %s (%s)\n", XB_AGENT_LABEL,
+           xb_loaded ? "loaded" : "NOT loaded");
+    if (xb_loaded) {
+        if (xb_running) {
+            printf("  engine    : running (pid %ld)\n", xb_pid);
+        } else {
+            printf("  engine    : loaded but no process (idle/throttled/"
+                   "waiting for devices)\n");
+        }
+    } else {
+        printf("  engine    : not running (agent not loaded)\n");
+    }
+
+    blackhole_liveness();
+
+    int pd_loaded = xb_service_is_loaded(XB_PD_AGENT_LABEL);
+    printf("  pd bridge : %s (%s)\n", XB_PD_AGENT_LABEL,
+           pd_loaded ? "LOADED — this is the active bridge" : "not loaded");
+
+    if (xb_loaded && pd_loaded) {
+        printf("\n  WARNING: both bridges are loaded — they will contend for "
+               "the interface.\n           Unload one.\n");
+    }
+    if (!xb_loaded && !pd_loaded) {
+        printf("\n  No bridge is loaded. Run `xlrbridge setup` (or load the Pd "
+               "bridge) to route your mic.\n");
+    }
+    return 0;
+}
+
+/* `fix`: re-resolve devices and reload the dev.xlrbridge agent (unload+load).
+ * The engine matches by UID and waits for devices, so a reload is all that's
+ * normally needed (panic button). Returns 0 on success. */
+static int cmd_fix(void) {
+    char plist[1024];
+    if (xb_service_plist_path(plist, sizeof(plist)) != 0) {
+        fprintf(stderr, "xlrbridge: fix: cannot resolve plist path\n");
+        return 1;
+    }
+
+    /* Re-resolve the configured devices so we report what fix is targeting. */
+    xb_config cfg;
+    if (xb_config_load(&cfg) != XB_CONFIG_ERROR && cfg.interface_uid[0]) {
+        AudioDeviceID iface = xb_resolve_device_by_uid(cfg.interface_uid);
+        AudioDeviceID bh    = xb_resolve_device_by_uid(cfg.blackhole_uid);
+        printf("xlrbridge fix: re-resolving devices...\n");
+        printf("  interface %s -> %s\n", cfg.interface_uid,
+               iface == XB_DEVICE_UNKNOWN ? "NOT present (engine will wait)"
+                                          : "present");
+        printf("  blackhole %s -> %s\n", cfg.blackhole_uid,
+               bh == XB_DEVICE_UNKNOWN ? "NOT present (engine will wait)"
+                                       : "present");
+    }
+
+    /* Ensure the plist exists (re-write it if missing), then reload. */
+    if (access(plist, F_OK) != 0) {
+        printf("  plist missing; re-writing %s\n", plist);
+        if (xb_service_write_plist(NULL) != 0) {
+            fprintf(stderr, "xlrbridge: fix: failed to write plist\n");
+            return 1;
+        }
+    }
+
+    printf("  reloading agent %s ...\n", XB_AGENT_LABEL);
+    xb_service_unload();
+    if (xb_service_load() != 0) {
+        fprintf(stderr, "xlrbridge: fix: failed to reload the agent\n");
+        return 1;
+    }
+    printf("Reloaded. Check with `xlrbridge status`.\n");
+    return 0;
+}
+
+/* `uninstall`: unload + remove the dev.xlrbridge plist. The engine destroys its
+ * own private aggregate when it stops, so there's nothing else to clean up.
+ * Returns 0 on success. */
+static int cmd_uninstall(void) {
+    char plist[1024];
+    xb_service_plist_path(plist, sizeof(plist));
+
+    printf("xlrbridge uninstall: unloading + removing %s\n", XB_AGENT_LABEL);
+    xb_service_unload(); /* tolerate not-loaded */
+    if (xb_service_remove_plist() != 0) {
+        fprintf(stderr, "xlrbridge: uninstall: failed to remove plist\n");
+        return 1;
+    }
+    printf("Removed %s\n", plist);
+    printf("The engine destroys its private aggregate on stop; nothing else "
+           "to clean up.\n");
+    printf("(Config left at ~/.config/xlrbridge/config.json.)\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage();
@@ -729,9 +938,20 @@ int main(int argc, char **argv) {
         return cmd_setup(argc - 2, argv + 2);
     }
 
-    if (strcmp(cmd, "status") == 0 || strcmp(cmd, "fix") == 0 ||
-        strcmp(cmd, "gain") == 0 || strcmp(cmd, "uninstall") == 0) {
-        printf("xlrbridge: '%s' is not yet implemented.\n", cmd);
+    if (strcmp(cmd, "status") == 0) {
+        return cmd_status();
+    }
+
+    if (strcmp(cmd, "fix") == 0) {
+        return cmd_fix();
+    }
+
+    if (strcmp(cmd, "uninstall") == 0) {
+        return cmd_uninstall();
+    }
+
+    if (strcmp(cmd, "gain") == 0) {
+        printf("xlrbridge: 'gain' is not yet implemented (Phase 6).\n");
         return 0;
     }
 
