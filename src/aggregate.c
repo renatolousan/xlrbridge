@@ -25,6 +25,7 @@
 
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -196,9 +197,14 @@ static int compute_offsets(AudioDeviceID agg,
         CFStringRef cfuid = (CFStringRef)CFArrayGetValueAtIndex(list, i);
         char uid[256];
         uid[0] = '\0';
-        if (cfuid != NULL) {
-            CFStringGetCString(cfuid, uid, (CFIndex)sizeof(uid),
-                               kCFStringEncodingUTF8);
+        if (cfuid == NULL ||
+            !CFStringGetCString(cfuid, uid, (CFIndex)sizeof(uid),
+                                kCFStringEncodingUTF8)) {
+            fprintf(stderr,
+                    "xlrbridge: could not resolve aggregate sub-device UID "
+                    "(index %ld) — failing offset computation\n", (long)i);
+            CFRelease(list);
+            return -1;
         }
 
         AudioDeviceID sub = xb_resolve_device_by_uid(uid);

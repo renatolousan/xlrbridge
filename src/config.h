@@ -3,10 +3,19 @@
  *
  * The `setup` command writes the user's choices; `run` reads them back when
  * its flags are omitted (flags > config > built-in defaults). The file lives
- * at ~/.config/xlrbridge/config.json and uses a tiny, dependency-free
- * key=value format (one `key = value` per line, `#` comments and blank lines
- * ignored, surrounding whitespace trimmed) — no external JSON library, robust
- * to a missing file and stray whitespace.
+ * at ~/.config/xlrbridge/config.json and uses a tiny, dependency-free flat
+ * JSON object (no external JSON library), e.g.:
+ *
+ *   {
+ *     "interface_uid": "AppleUSBAudioEngine:Topping:E2x2:...",
+ *     "in_channel": 0,
+ *     "gain_db": 2.0,
+ *     "blackhole_uid": "BlackHole2ch_UID"
+ *   }
+ *
+ * The parser handles only this flat shape but is forgiving: arbitrary
+ * whitespace, key ordering, missing keys (defaults kept), and \" / \\ escapes
+ * in string values are all tolerated, and it is robust to a missing file.
  */
 
 #ifndef XLRBRIDGE_CONFIG_H

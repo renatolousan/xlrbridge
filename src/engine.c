@@ -119,11 +119,26 @@ static OSStatus xb_ioproc(AudioObjectID inDevice,
         if (ctx->src.buffer < 0 || ctx->dl.buffer < 0 || ctx->dr.buffer < 0) {
             atomic_store_explicit(&ctx->resolve_failed, 1, memory_order_release);
             atomic_store_explicit(&ctx->resolved, 1, memory_order_release);
-            return noErr; /* leave outputs as the HAL gave them (silence) */
+            /* Bad layout: zero outputs so BlackHole gets silence (not stale HAL
+             * samples) for the cycles before teardown. RT-safe (memset only). */
+            for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
+                AudioBuffer *ob = &outOutputData->mBuffers[b];
+                if (ob->mData != NULL && ob->mDataByteSize > 0) {
+                    memset(ob->mData, 0, ob->mDataByteSize);
+                }
+            }
+            return noErr;
         }
         atomic_store_explicit(&ctx->resolved, 1, memory_order_release);
     }
     if (atomic_load_explicit(&ctx->resolve_failed, memory_order_acquire)) {
+        /* Keep feeding silence on every cycle until teardown. */
+        for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
+            AudioBuffer *ob = &outOutputData->mBuffers[b];
+            if (ob->mData != NULL && ob->mDataByteSize > 0) {
+                memset(ob->mData, 0, ob->mDataByteSize);
+            }
+        }
         return noErr;
     }
 

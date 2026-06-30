@@ -853,7 +853,7 @@ static int cmd_fix(void) {
 
     /* Re-resolve the configured devices so we report what fix is targeting. */
     xb_config cfg;
-    if (xb_config_load(&cfg) != XB_CONFIG_ERROR && cfg.interface_uid[0]) {
+    if (xb_config_load(&cfg) == XB_CONFIG_OK && cfg.interface_uid[0]) {
         AudioDeviceID iface = xb_resolve_device_by_uid(cfg.interface_uid);
         AudioDeviceID bh    = xb_resolve_device_by_uid(cfg.blackhole_uid);
         printf("xlrbridge fix: re-resolving devices...\n");
